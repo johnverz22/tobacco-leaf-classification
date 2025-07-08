@@ -1,0 +1,104 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+*.tmp
+*.bak
+*.orig
+*.rej
+.DS_Store
+.DS_Store?
+ehthumbs.db
+Icon?
+Thumbs.db
+desktop.ini
+
+# Backup files
+*~
+*.sw?
+
+# System files
+.Trashes
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.fseventsd
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Project history and build logs
+.atom/
+.buildlog/
+.history
+.svn/
+migrate_working_dir/
+
+# IntelliJ/Android Studio related
+*.iml
+*.ipr
+*.iws
+.idea/
+.idea/*
+
+# VS Code related
+.vscode/
+
+# Flutter/Dart/Pub related
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+**/build/
+**/doc/api/
+**/ios/Flutter/.last_build_id
+
+# Xcode related
+*.xcworkspace
+*.xcuserstate
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+!*.xcodeproj/xcshareddata/
+*.xcsettings
+DerivedData/
+*.xcuserdatad/
+*.moved-aside
+*.hmap
+*.ipa
+
+# Android related
+android/.gradle/
+android/.idea/
+android/.settings/
+android/build/
+*.jks
+**/android/**/captures/
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Firebase/Crashlytics
+crashlytics-build.properties
+firebase-debug.log
+
+# Coverage
+coverage/
+
+# Env files
+.env
+.env.*
+
+# Personal configuration
+*.code-workspace
