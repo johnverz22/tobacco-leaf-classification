@@ -1,6 +1,6 @@
 {
-    "name": "tobaccoclassification",
-    "short_name": "tobaccoclassification",
+    "name": "tob_leaf_classy",
+    "short_name": "tob_leaf_classy",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
