@@ -1,0 +1,12 @@
+services:
+  tobacco:
+    build: .
+    restart: unless-stopped
+    networks:
+      - fixo_network
+    ports:
+      - 8090:8090
+
+networks:
+  fixo_network:
+    external: true

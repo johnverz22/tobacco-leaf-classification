@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import tensorflow as tf
 import numpy as np
 from PIL import Image
@@ -8,6 +9,7 @@ from tensorflow.keras.applications import EfficientNetB3
 
 # Initialize Flask app
 app = Flask(__name__)
+CORS(app) #Enable CORS for all routes
 
 # Load your trained classifier model
 try:
@@ -63,4 +65,4 @@ def predict():
 
 if __name__ == "__main__":
     # Run Flask server on 0.0.0.0 to work with NGROK
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=8090, debug=True)
