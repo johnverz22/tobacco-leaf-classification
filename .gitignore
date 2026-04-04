@@ -102,3 +102,7 @@ coverage/
 
 # Personal configuration
 *.code-workspace
+
+
+.venv/
+dataset/

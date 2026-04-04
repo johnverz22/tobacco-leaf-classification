@@ -1,12 +1,21 @@
-import 'dart:convert';
+import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
+
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:image/image.dart' as img;
+
+import 'pages/help_page.dart';
+import 'pages/settings_page.dart';
+import 'services/app_constants.dart';
+import 'services/classification_analytics_service.dart';
+import 'services/offline_classifier_service.dart';
 
 void main() {
-  runApp(TobaccoClassifierApp());
+  runApp(const TobaccoClassifierApp());
 }
 
 class TobaccoClassifierApp extends StatelessWidget {
@@ -18,10 +27,9 @@ class TobaccoClassifierApp extends StatelessWidget {
       title: 'Leaf Identifier',
       theme: ThemeData(
         primarySwatch: Colors.green,
-        fontFamily: 'SF Pro Display',
         scaffoldBackgroundColor: Colors.black,
       ),
-      home: HomePage(),
+      home: const HomePage(),
       debugShowCheckedModeBanner: false,
     );
   }
@@ -36,278 +44,718 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   File? _imageFile;
-  String _resultText = "";
-  String _confidenceText = "";
+  String _resultText = '';
+  String _confidenceText = '';
   bool _loading = false;
-  bool _hasResult = false;
-  String _apiUrl = "https://e90a28ec54a7.ngrok-free.app/predict"; // Default URL
-  
-  late AnimationController _fadeController;
-  late AnimationController _slideController;
-  late Animation<double> _fadeAnimation;
-  late Animation<Offset> _slideAnimation;
+  int _totalClassifications = 0;
 
   final ImagePicker _picker = ImagePicker();
+  late final OfflineClassifierService _offlineClassifier;
+  final ClassificationAnalyticsService _analyticsService =
+      ClassificationAnalyticsService();
+  late final AnimationController _fadeController;
+  late final AnimationController _slideController;
+  late final Animation<double> _fadeAnimation;
+  late final Animation<Offset> _slideAnimation;
+  CameraController? _cameraController;
+  int _cameraSensorOrientation = 0;
+  bool _cameraReady = false;
+  /// True after [availableCameras] + [initialize] + stream attempt finishes (success or failure).
+  bool _cameraInitComplete = false;
+  bool _isProcessingFrame = false;
+  bool _classificationLocked = false;
+  bool _showGuideHint = true;
+  _CameraFullscreenData? _cameraFullscreen;
+  bool _streamPausedForResult = false;
 
   @override
   void initState() {
     super.initState();
-    _loadApiUrl(); // Load saved API URL
+    _offlineClassifier = OfflineClassifierService()..initialize();
     _fadeController = AnimationController(
-      duration: Duration(milliseconds: 800),
+      duration: const Duration(milliseconds: 800),
       vsync: this,
     );
     _slideController = AnimationController(
-      duration: Duration(milliseconds: 600),
+      duration: const Duration(milliseconds: 600),
       vsync: this,
     );
-    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+    _fadeAnimation = Tween<double>(begin: 0, end: 1).animate(
       CurvedAnimation(parent: _fadeController, curve: Curves.easeInOut),
     );
-    _slideAnimation = Tween<Offset>(
-      begin: Offset(0, 0.3),
-      end: Offset.zero,
-    ).animate(CurvedAnimation(parent: _slideController, curve: Curves.easeOutCubic));
+    _slideAnimation =
+        Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero).animate(
+          CurvedAnimation(parent: _slideController, curve: Curves.easeOutCubic),
+        );
+    _hideGuideHintLater();
+    _loadCounter();
+    _initializeCamera();
   }
 
-  Future<void> _loadApiUrl() async {
-    final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      _apiUrl = prefs.getString('api_url') ?? "https://576a45782a0b.ngrok-free.app/predict";
-    });
+  Future<void> _hideGuideHintLater() async {
+    await Future.delayed(const Duration(seconds: 5));
+    if (!mounted) return;
+    setState(() => _showGuideHint = false);
   }
 
-  Future<void> _saveApiUrl(String url) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('api_url', url);
-    setState(() {
-      _apiUrl = url;
-    });
+  Future<void> _loadCounter() async {
+    final total = await _analyticsService.getTotalClassifications();
+    if (!mounted) return;
+    setState(() => _totalClassifications = total);
   }
 
   @override
   void dispose() {
+    _cameraController?.dispose();
+    _offlineClassifier.dispose();
     _fadeController.dispose();
     _slideController.dispose();
     super.dispose();
   }
 
-  Future<void> _getImage(ImageSource source) async {
-    final pickedFile = await _picker.pickImage(source: source);
-    if (pickedFile == null) return;
-
-    setState(() {
-      _imageFile = File(pickedFile.path);
-      _loading = true;
-      _hasResult = false;
-    });
-
-    await _sendToServer(_imageFile!);
-  }
-
-  Future<void> _sendToServer(File imageFile) async {
+  Future<void> _initializeCamera() async {
     try {
-      var request = http.MultipartRequest("POST", Uri.parse(_apiUrl));
-      request.headers['ngrok-skip-browser-warning'] = 'true';
-      request.files.add(
-        await http.MultipartFile.fromPath('image', imageFile.path),
-      );
-
-      var response = await request.send();
-      var responseData = await http.Response.fromStream(response);
-
-      if (response.statusCode == 200) {
-        final data = jsonDecode(responseData.body);
-        
-        // Safe confidence parsing
-        double confidenceValue = 0.0;
-        String confidenceDisplay = "N/A";
-        
-        if (data['confidence'] != null) {
-          try {
-            // Try to parse as double first
-            if (data['confidence'] is double) {
-              confidenceValue = data['confidence'];
-            } else if (data['confidence'] is int) {
-              confidenceValue = data['confidence'].toDouble();
-            } else if (data['confidence'] is String) {
-              confidenceValue = double.parse(data['confidence']);
-            }
-            
-            // If confidence is already a percentage (>1), don't multiply by 100
-            if (confidenceValue > 1) {
-              confidenceDisplay = "${confidenceValue.toStringAsFixed(1)}%";
-            } else {
-              confidenceDisplay = "${(confidenceValue * 100).toStringAsFixed(1)}%";
-            }
-          } catch (e) {
-            // print("Confidence parsing error: $e");
-            confidenceDisplay = data['confidence'].toString();
-          }
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) {
+        if (mounted) {
+          setState(() => _cameraInitComplete = true);
         }
-        
-        setState(() {
-          _resultText = data['prediction'] ?? 'Unknown';
-          _confidenceText = confidenceDisplay;
-          _hasResult = true;
-        });
-        _fadeController.forward();
-        _slideController.forward();
-      } else {
-        setState(() {
-          _resultText = "Analysis failed";
-          _confidenceText = "Server error ${response.statusCode}";
-          _hasResult = true;
-        });
-        _fadeController.forward();
-        _slideController.forward();
+        return;
       }
-    } catch (e) {
+      final back = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.first,
+      );
+      final controller = CameraController(
+        back,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420,
+      );
+      await controller.initialize();
+      // Ensure autofocus is enabled for near-field leaf capture.
+      try {
+        await controller.setFocusMode(FocusMode.auto);
+        await controller.setFocusPoint(const Offset(0.5, 0.5));
+      } catch (_) {}
+      await controller.startImageStream(_onCameraFrame);
+      if (!mounted) return;
       setState(() {
-        _resultText = "Connection error";
-        _confidenceText = "Check your network";
-        _hasResult = true;
+        _cameraController = controller;
+        _cameraSensorOrientation = back.sensorOrientation;
+        _cameraReady = true;
+        _cameraInitComplete = true;
       });
-      _fadeController.forward();
-      _slideController.forward();
-    } finally {
-      setState(() {
-        _loading = false;
-      });
+    } catch (_) {
+      // Keep UI functional (gallery path) even if camera stream fails.
+      if (mounted) {
+        setState(() => _cameraInitComplete = true);
+      }
     }
   }
 
-  void _resetToCamera() {
+  Future<void> _onCameraFrame(CameraImage frame) async {
+    if (_isProcessingFrame || _loading || _classificationLocked) return;
+    _isProcessingFrame = true;
+    try {
+      final jpgBytes = _cameraImageToJpeg(frame);
+      if (jpgBytes == null) return;
+
+      final gatePassed = await _offlineClassifier.gatekeeperPassesBytes(
+        jpgBytes,
+      );
+      if (!gatePassed) return;
+
+      _classificationLocked = true;
+      setState(() {
+        _loading = true;
+        _imageFile = null;
+      });
+
+      final output = await _offlineClassifier.classifyBytes(jpgBytes);
+      if (!mounted) return;
+
+      if (!output.gatePassed) {
+        setState(() {
+          _classificationLocked = false;
+          _loading = false;
+        });
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Could not confirm leaf — try again'),
+              behavior: SnackBarBehavior.floating,
+            ),
+          );
+        }
+        return;
+      }
+
+      if (output.error != null) {
+        try {
+          await _cameraController?.stopImageStream();
+        } catch (_) {}
+        _streamPausedForResult = true;
+        setState(() {
+          _loading = false;
+          _cameraFullscreen = _CameraFullscreenData(
+            previewBytes: jpgBytes,
+            title: 'Analysis failed',
+            body: output.error!,
+            kind: _CameraFullscreenKind.error,
+          );
+        });
+        return;
+      }
+
+      final prediction = output.prediction ?? 'Unknown';
+      final confidence = output.confidence ?? 0;
+
+      if (confidence < AppConstants.minClassificationConfidence) {
+        try {
+          await _cameraController?.stopImageStream();
+        } catch (_) {}
+        _streamPausedForResult = true;
+        setState(() {
+          _loading = false;
+          _cameraFullscreen = _CameraFullscreenData(
+            previewBytes: jpgBytes,
+            title: 'Confidence too low',
+            body:
+                'Best match ${(confidence * 100).toStringAsFixed(1)}% — need at least ${(AppConstants.minClassificationConfidence * 100).toStringAsFixed(0)}% to record a grade. Ensure the leaf is on a dark surface.',
+            kind: _CameraFullscreenKind.lowConfidence,
+          );
+        });
+        return;
+      }
+
+      await _analyticsService.recordClassification(
+        label: prediction,
+        confidence: confidence,
+      );
+      await _loadCounter();
+      final legend = labelLegend[prediction];
+      final detailed = legend == null
+          ? prediction
+          : '$prediction - ${legend.description} (${legend.ntaGrade})';
+
+      try {
+        await _cameraController?.stopImageStream();
+      } catch (_) {}
+      _streamPausedForResult = true;
+      setState(() {
+        _loading = false;
+        _cameraFullscreen = _CameraFullscreenData(
+          previewBytes: jpgBytes,
+          title: detailed,
+          body: '${(confidence * 100).toStringAsFixed(1)}% confidence',
+          kind: _CameraFullscreenKind.success,
+        );
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _classificationLocked = false;
+          _loading = false;
+        });
+      }
+    } finally {
+      _isProcessingFrame = false;
+    }
+  }
+
+  Future<void> _resumeCameraScanning() async {
+    if (!mounted) return;
     setState(() {
-      _imageFile = null;
-      _hasResult = false;
+      _cameraFullscreen = null;
+      _resultText = '';
+      _confidenceText = '';
       _loading = false;
     });
+    _classificationLocked = false;
+    _fadeController.reset();
+    _slideController.reset();
+    if (!_streamPausedForResult) return;
+    final c = _cameraController;
+    if (c != null && c.value.isInitialized && _cameraReady) {
+      try {
+        await c.startImageStream(_onCameraFrame);
+        _streamPausedForResult = false;
+      } catch (_) {}
+    }
+  }
+
+  Uint8List? _cameraImageToJpeg(CameraImage image) {
+    if (image.format.group != ImageFormatGroup.yuv420 ||
+        image.planes.length < 3) {
+      return null;
+    }
+    final width = image.width;
+    final height = image.height;
+    final imgBuf = img.Image(width: width, height: height);
+
+    final yPlane = image.planes[0];
+    final uPlane = image.planes[1];
+    final vPlane = image.planes[2];
+
+    for (var y = 0; y < height; y++) {
+      for (var x = 0; x < width; x++) {
+        final uvX = x ~/ 2;
+        final uvY = y ~/ 2;
+        final yIndex = y * yPlane.bytesPerRow + x;
+        final uvIndex = uvY * uPlane.bytesPerRow + uvX * uPlane.bytesPerPixel!;
+
+        final yp = yPlane.bytes[yIndex];
+        final up = uPlane.bytes[uvIndex];
+        final vp = vPlane.bytes[uvIndex];
+
+        final r = (yp + 1.402 * (vp - 128)).round().clamp(0, 255);
+        final g = (yp - 0.344136 * (up - 128) - 0.714136 * (vp - 128))
+            .round()
+            .clamp(0, 255);
+        final b = (yp + 1.772 * (up - 128)).round().clamp(0, 255);
+
+        imgBuf.setPixelRgb(x, y, r, g, b);
+      }
+    }
+
+    // Rotate to match screen orientation.
+    // Android back camera sensor is typically 90° rotated relative to portrait.
+    final rotated = switch (_cameraSensorOrientation) {
+      90  => img.copyRotate(imgBuf, angle: 90),
+      180 => img.copyRotate(imgBuf, angle: 180),
+      270 => img.copyRotate(imgBuf, angle: 270),
+      _   => imgBuf,
+    };
+
+    return Uint8List.fromList(img.encodeJpg(rotated, quality: 85));
+  }
+
+  Future<void> _getImage(ImageSource source) async {
+    final picked = await _picker.pickImage(source: source);
+    if (picked == null) return;
+
+    setState(() {
+      _imageFile = File(picked.path);
+      _loading = true;
+    });
+    await _runOfflinePipeline(_imageFile!);
+  }
+
+  Future<void> _runOfflinePipeline(File imageFile) async {
+    try {
+      final output = await _offlineClassifier.classify(imageFile);
+      if (!mounted) return;
+      if (!output.gatePassed) {
+        setState(() {
+          _resultText = 'No tobacco detected';
+          _confidenceText = 'Gatekeeper rejected';
+        });
+      } else if (output.error != null) {
+        setState(() {
+          _resultText = 'Analysis failed';
+          _confidenceText = output.error!;
+        });
+      } else {
+        final prediction = output.prediction ?? 'Unknown';
+        final confidence = output.confidence ?? 0;
+        if (confidence < AppConstants.minClassificationConfidence) {
+          setState(() {
+            _resultText = 'Confidence too low';
+            _confidenceText =
+                'Best match ${(confidence * 100).toStringAsFixed(1)}% — need ${(AppConstants.minClassificationConfidence * 100).toStringAsFixed(0)}% or higher to record.';
+          });
+        } else {
+          await _analyticsService.recordClassification(
+            label: prediction,
+            confidence: confidence,
+          );
+          await _loadCounter();
+          final legend = labelLegend[prediction];
+          final detailed = legend == null
+              ? prediction
+              : '$prediction - ${legend.description} (${legend.ntaGrade})';
+          setState(() {
+            _resultText = detailed;
+            _confidenceText = '${(confidence * 100).toStringAsFixed(1)}%';
+          });
+        }
+      }
+      _fadeController.forward(from: 0);
+      _slideController.forward(from: 0);
+    } finally {
+      if (mounted) {
+        setState(() => _loading = false);
+      }
+    }
+  }
+
+  Future<void> _openHelp() async {
+    await Navigator.of(
+      context,
+    ).push(MaterialPageRoute(builder: (_) => const HelpPage()));
+  }
+
+  Future<void> _openSettings() async {
+    final updated = await Navigator.of(
+      context,
+    ).push<bool>(MaterialPageRoute(builder: (_) => const SettingsPage()));
+    if (!mounted) return;
+    await _loadCounter();
+    if (!mounted) return;
+    if (updated == true) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Location saved'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  void _reset() {
+    if (_streamPausedForResult) {
+      unawaited(_resumeCameraScanning());
+      return;
+    }
+    setState(() {
+      _imageFile = null;
+      _loading = false;
+      _resultText = '';
+      _confidenceText = '';
+      _cameraFullscreen = null;
+    });
+    _classificationLocked = false;
     _fadeController.reset();
     _slideController.reset();
   }
+
+  bool get _isError =>
+      _resultText.toLowerCase().contains('failed') ||
+      _resultText.toLowerCase().contains('error');
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       body: Stack(
         children: [
-          // Main Content
-          _imageFile == null ? _buildCameraView() : _buildResultView(),
-          
-          // Top App Bar
+          if (_cameraFullscreen != null)
+            _buildCameraFullscreenResult()
+          else if (_imageFile == null)
+            _buildCameraView()
+          else
+            _buildResultView(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCameraFullscreenResult() {
+    final data = _cameraFullscreen!;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        Positioned.fill(
+          child: Image.memory(data.previewBytes, fit: BoxFit.cover),
+        ),
+        Positioned.fill(
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  Colors.black.withValues(alpha: 0.5),
+                  Colors.black.withValues(alpha: 0.88),
+                ],
+              ),
+            ),
+          ),
+        ),
+        SafeArea(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Align(
+                alignment: Alignment.centerLeft,
+                child: IconButton(
+                  onPressed: _resumeCameraScanning,
+                  icon: const Icon(Icons.close, color: Colors.white, size: 28),
+                ),
+              ),
+              const Spacer(),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(
+                      data.kind == _CameraFullscreenKind.success
+                          ? Icons.check_circle
+                          : data.kind == _CameraFullscreenKind.lowConfidence
+                              ? Icons.help_outline
+                              : Icons.error_outline,
+                      color: data.kind == _CameraFullscreenKind.success
+                          ? const Color(0xFF4CAF50)
+                          : Colors.white70,
+                      size: 48,
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      data.title,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 22,
+                        fontWeight: FontWeight.w700,
+                        height: 1.25,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      data.body,
+                      style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.92),
+                        fontSize: 16,
+                        height: 1.35,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Spacer(),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 0, 24, 28),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _resumeCameraScanning,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF4CAF50),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 18),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                    child: const Text(
+                      'Scan again',
+                      style: TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCameraView() {
+    if (_cameraReady && _cameraController != null) {
+      return Stack(
+        fit: StackFit.expand,
+        children: [
+          CameraPreview(_cameraController!),
+          IgnorePointer(
+            child: CustomPaint(
+              size: Size.infinite,
+              painter: _LeafGuidePainter(),
+            ),
+          ),
+          if (_showGuideHint)
+            Positioned(
+              top: 110,
+              left: 20,
+              right: 20,
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.45),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Text(
+                    'Place leaf on dark surface for instant detection',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          if (_loading)
+            const Center(
+              child: CircularProgressIndicator(
+                valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF4CAF50)),
+              ),
+            ),
           Positioned(
-            top: 0,
+            bottom: 0,
             left: 0,
             right: 0,
             child: Container(
               padding: EdgeInsets.only(
-                top: MediaQuery.of(context).padding.top + 10,
                 left: 20,
                 right: 20,
-                bottom: 10,
+                top: 12,
+                bottom: MediaQuery.of(context).padding.bottom + 12,
               ),
               decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topCenter,
-                  end: Alignment.bottomCenter,
-                  colors: [
-                    Colors.black.withOpacity(0.7),
-                    Colors.transparent,
-                  ],
-                ),
+                color: Colors.black.withValues(alpha: 0.55),
               ),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  _imageFile != null
-                      ? GestureDetector(
-                          onTap: _resetToCamera,
-                          child: Container(
-                            padding: EdgeInsets.all(8),
-                            decoration: BoxDecoration(
-                              color: Colors.black.withOpacity(0.5),
-                              borderRadius: BorderRadius.circular(20),
-                            ),
-                            child: Icon(
-                              Icons.arrow_back_ios,
-                              color: Colors.white,
-                              size: 20,
-                            ),
-                          ),
-                        )
-                      : Container(width: 36),
-                  Text(
-                    'Leaf Identifier',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
+                  // Gallery picker
                   GestureDetector(
-                    onTap: () => _showSettingsDialog(),
+                    onTap: () => _getImage(ImageSource.gallery),
                     child: Container(
-                      padding: EdgeInsets.all(8),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 8,
+                      ),
                       decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.5),
+                        color: Colors.white.withValues(alpha: 0.12),
                         borderRadius: BorderRadius.circular(20),
                       ),
-                      child: Icon(
-                        Icons.settings,
-                        color: Colors.white,
-                        size: 20,
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.photo_library_outlined,
+                            color: Colors.white,
+                            size: 18,
+                          ),
+                          SizedBox(width: 6),
+                          Text(
+                            'Select Image',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
+                  ),
+                  // Counter pill
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: Text(
+                      '$_totalClassifications scanned',
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                  // Help + Settings
+                  Row(
+                    children: [
+                      GestureDetector(
+                        onTap: _openHelp,
+                        child: Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.12),
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(
+                            Icons.help_outline_rounded,
+                            color: Colors.white,
+                            size: 20,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      GestureDetector(
+                        onTap: _openSettings,
+                        child: Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.12),
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(
+                            Icons.settings_outlined,
+                            color: Colors.white,
+                            size: 20,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
             ),
           ),
         ],
-      ),
-    );
-  }
-
-  Widget _buildCameraView() {
+      );
+    }
+    // While the live preview is starting, avoid flashing the legacy gallery/camera picker UI.
+    if (!_cameraInitComplete) {
+      return const ColoredBox(
+        color: Colors.black,
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CircularProgressIndicator(
+                valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF4CAF50)),
+              ),
+              SizedBox(height: 20),
+              Text(
+                'Starting camera…',
+                style: TextStyle(
+                  color: Colors.white70,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    // No camera or init failed: legacy picker-only screen (gallery + one-shot camera).
     return Container(
       width: double.infinity,
       height: double.infinity,
-      decoration: BoxDecoration(
+      decoration: const BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
-          colors: [
-            Color(0xFF1a1a1a),
-            Color(0xFF2d2d2d),
-          ],
+          colors: [Color(0xFF1a1a1a), Color(0xFF2d2d2d)],
         ),
       ),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Spacer(),
-          
-          // Camera Icon
-          Container(
-            padding: EdgeInsets.all(40),
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              border: Border.all(
-                color: Colors.white.withOpacity(0.3),
-                width: 2,
-              ),
-            ),
-            child: Icon(
-              Icons.camera_alt_outlined,
-              size: 80,
-              color: Colors.white.withOpacity(0.7),
-            ),
+          const Spacer(),
+          const Icon(
+            Icons.camera_alt_outlined,
+            size: 80,
+            color: Colors.white70,
           ),
-          
-          SizedBox(height: 30),
-          
-          Text(
+          const SizedBox(height: 30),
+          const Text(
             'Identify Tobacco Leaves',
             style: TextStyle(
               color: Colors.white,
@@ -315,22 +763,17 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
               fontWeight: FontWeight.bold,
             ),
           ),
-          
-          SizedBox(height: 10),
-          
+          const SizedBox(height: 10),
           Text(
             'Capture or select an image to analyze',
             style: TextStyle(
-              color: Colors.white.withOpacity(0.7),
+              color: Colors.white.withValues(alpha: 0.7),
               fontSize: 16,
             ),
           ),
-          
-          Spacer(),
-          
-          // Action Buttons
+          const Spacer(),
           Padding(
-            padding: EdgeInsets.symmetric(horizontal: 40, vertical: 60),
+            padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 60),
             child: Row(
               children: [
                 Expanded(
@@ -340,7 +783,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                     onTap: () => _getImage(ImageSource.gallery),
                   ),
                 ),
-                SizedBox(width: 20),
+                const SizedBox(width: 20),
                 Expanded(
                   child: _buildActionButton(
                     icon: Icons.camera_alt,
@@ -366,27 +809,21 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        padding: EdgeInsets.symmetric(vertical: 16),
+        padding: const EdgeInsets.symmetric(vertical: 16),
         decoration: BoxDecoration(
-          color: isPrimary ? Color(0xFF4CAF50) : Colors.white.withOpacity(0.1),
+          color: isPrimary
+              ? const Color(0xFF4CAF50)
+              : Colors.white.withValues(alpha: 0.1),
           borderRadius: BorderRadius.circular(25),
-          border: Border.all(
-            color: isPrimary ? Color(0xFF4CAF50) : Colors.white.withOpacity(0.3),
-            width: 1,
-          ),
         ),
         child: Column(
           children: [
-            Icon(
-              icon,
-              color: isPrimary ? Colors.white : Colors.white.withOpacity(0.9),
-              size: 28,
-            ),
-            SizedBox(height: 8),
+            Icon(icon, color: Colors.white, size: 28),
+            const SizedBox(height: 8),
             Text(
               label,
-              style: TextStyle(
-                color: isPrimary ? Colors.white : Colors.white.withOpacity(0.9),
+              style: const TextStyle(
+                color: Colors.white,
                 fontSize: 14,
                 fontWeight: FontWeight.w600,
               ),
@@ -400,50 +837,21 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   Widget _buildResultView() {
     return Stack(
       children: [
-        // Full screen image background
-        Container(
-          width: double.infinity,
-          height: double.infinity,
-          child: _imageFile != null
-              ? Image.file(
-                  _imageFile!,
-                  fit: BoxFit.cover,
-                )
-              : Container(color: Colors.grey[900]),
-        ),
-        
-        // Bottom sheet overlay
+        SizedBox.expand(child: Image.file(_imageFile!, fit: BoxFit.cover)),
         Positioned(
           bottom: 0,
           left: 0,
           right: 0,
           child: Container(
             height: MediaQuery.of(context).size.height * 0.45,
-            decoration: BoxDecoration(
+            decoration: const BoxDecoration(
               color: Colors.white,
               borderRadius: BorderRadius.only(
                 topLeft: Radius.circular(30),
                 topRight: Radius.circular(30),
               ),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(0.2),
-                  blurRadius: 20,
-                  offset: Offset(0, -5),
-                ),
-              ],
             ),
-            child: ClipRRect(
-              borderRadius: BorderRadius.only(
-                topLeft: Radius.circular(30),
-                topRight: Radius.circular(30),
-              ),
-              child: _loading
-                  ? _buildLoadingState()
-                  : _hasResult
-                      ? _buildResultState()
-                      : _buildInitialState(),
-            ),
+            child: _loading ? _buildLoadingState() : _buildResultState(),
           ),
         ),
       ],
@@ -455,11 +863,10 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          CircularProgressIndicator(
+          const CircularProgressIndicator(
             valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF4CAF50)),
-            strokeWidth: 3,
           ),
-          SizedBox(height: 20),
+          const SizedBox(height: 20),
           Text(
             'Analyzing leaf...',
             style: TextStyle(
@@ -473,224 +880,55 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     );
   }
 
-  Widget _buildInitialState() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(
-            Icons.image,
-            size: 48,
-            color: Colors.grey[400],
-          ),
-          SizedBox(height: 16),
-          Text(
-            'Image loaded',
-            style: TextStyle(
-              fontSize: 18,
-              color: Colors.grey[600],
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-          SizedBox(height: 8),
-          Text(
-            'Processing will start automatically',
-            style: TextStyle(
-              fontSize: 14,
-              color: Colors.grey[500],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildResultCard({
-    required String title,
-    required String value,
-    required IconData icon,
-    required Color color,
-  }) {
-    return Container(
-      padding: EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.05),
-        borderRadius: BorderRadius.circular(15),
-        border: Border.all(
-          color: color.withOpacity(0.2),
-          width: 1,
-        ),
-      ),
-      child: Row(
-        children: [
-          Icon(
-            icon,
-            color: color,
-            size: 24,
-          ),
-          SizedBox(width: 15),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                title,
-                style: TextStyle(
-                  fontSize: 14,
-                  color: Colors.grey[600],
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-              SizedBox(height: 4),
-              Text(
-                value,
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.grey[800],
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildPrimaryButton({
-    required String label,
-    required VoidCallback onTap,
-  }) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: EdgeInsets.symmetric(vertical: 16),
-        decoration: BoxDecoration(
-          color: Color(0xFF4CAF50),
-          borderRadius: BorderRadius.circular(25),
-        ),
-        child: Center(
-          child: Text(
-            label,
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildSecondaryButton({
-    required String label,
-    required VoidCallback onTap,
-  }) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: EdgeInsets.symmetric(vertical: 16),
-        decoration: BoxDecoration(
-          color: Colors.grey[100],
-          borderRadius: BorderRadius.circular(25),
-        ),
-        child: Center(
-          child: Text(
-            label,
-            style: TextStyle(
-              color: Colors.grey[700],
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
   Widget _buildResultState() {
     return FadeTransition(
       opacity: _fadeAnimation,
       child: SlideTransition(
         position: _slideAnimation,
         child: Padding(
-          padding: EdgeInsets.all(30),
+          padding: const EdgeInsets.all(30),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Result Header
               Row(
                 children: [
-                  Container(
-                    padding: EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: _resultText.contains('error') || _resultText.contains('failed') 
-                          ? Colors.red.withOpacity(0.1)
-                          : Color(0xFF4CAF50).withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Icon(
-                      _resultText.contains('error') || _resultText.contains('failed')
-                          ? Icons.error_outline
-                          : Icons.check_circle_outline,
-                      color: _resultText.contains('error') || _resultText.contains('failed')
-                          ? Colors.red
-                          : Color(0xFF4CAF50),
-                      size: 24,
-                    ),
+                  Icon(
+                    _isError ? Icons.error_outline : Icons.check_circle_outline,
+                    color: _isError ? Colors.red : const Color(0xFF4CAF50),
                   ),
-                  SizedBox(width: 12),
+                  const SizedBox(width: 10),
                   Text(
-                    _resultText.contains('error') || _resultText.contains('failed')
-                        ? 'Analysis Failed'
-                        : 'Analysis Complete',
-                    style: TextStyle(
+                    _isError ? 'Analysis Failed' : 'Analysis Complete',
+                    style: const TextStyle(
                       fontSize: 18,
                       fontWeight: FontWeight.w600,
-                      color: Colors.grey[800],
                     ),
                   ),
                 ],
               ),
-              
-              SizedBox(height: 30),
-              
-              // Classification Result
-              _buildResultCard(
-                title: 'Classification',
-                value: _resultText.isNotEmpty ? _resultText : 'No result',
-                icon: Icons.eco,
-                color: _resultText.contains('error') || _resultText.contains('failed')
-                    ? Colors.red
-                    : Color(0xFF4CAF50),
+              const SizedBox(height: 24),
+              Text(
+                'Classification: $_resultText',
+                style: const TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
-              
-              SizedBox(height: 20),
-              
-              // Confidence Level
-              _buildResultCard(
-                title: 'Confidence Level',
-                value: _confidenceText.isNotEmpty ? _confidenceText : 'N/A',
-                icon: Icons.analytics,
-                color: Color(0xFF2196F3),
+              const SizedBox(height: 10),
+              Text(
+                'Confidence: $_confidenceText',
+                style: const TextStyle(fontSize: 16),
               ),
-              
-              SizedBox(height: 20),
-              
-              // Action Buttons
+              const Spacer(),
               Row(
                 children: [
+                  Expanded(child: _button('Try Again', _reset, false)),
+                  const SizedBox(width: 15),
                   Expanded(
-                    child: _buildSecondaryButton(
-                      label: 'Try Again',
-                      onTap: _resetToCamera,
-                    ),
-                  ),
-                  SizedBox(width: 15),
-                  Expanded(
-                    child: _buildPrimaryButton(
-                      label: 'New Image',
-                      onTap: () => _getImage(ImageSource.camera),
+                    child: _button(
+                      'New Image',
+                      () => _getImage(ImageSource.camera),
+                      true,
                     ),
                   ),
                 ],
@@ -702,160 +940,99 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     );
   }
 
-  void _showSettingsDialog() {
-    final TextEditingController _urlController = TextEditingController();
-    
-    // Extract base URL from full URL for display
-    String baseUrl = _apiUrl.replaceAll('https://', '').replaceAll('/predict', '');
-    _urlController.text = baseUrl;
-
-    showDialog(
-      context: context,
-      builder: (BuildContext context) {
-        return Dialog(
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(20),
-          ),
-          child: Container(
-            padding: EdgeInsets.all(24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Icon(
-                      Icons.settings,
-                      color: Color(0xFF4CAF50),
-                      size: 24,
-                    ),
-                    SizedBox(width: 12),
-                    Text(
-                      'API Settings',
-                      style: TextStyle(
-                        fontSize: 20,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.grey[800],
-                      ),
-                    ),
-                  ],
-                ),
-                
-                SizedBox(height: 24),
-                
-                Text(
-                  'Server URL',
-                  style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                    color: Colors.grey[700],
-                  ),
-                ),
-                
-                SizedBox(height: 8),
-                
-                Container(
-                  decoration: BoxDecoration(
-                    border: Border.all(color: Colors.grey[300]!),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: TextField(
-                    controller: _urlController,
-                    decoration: InputDecoration(
-                      hintText: 'e90a28ec54a7.ngrok-free.app',
-                      hintStyle: TextStyle(color: Colors.grey[400]),
-                      border: InputBorder.none,
-                      contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                      prefixIcon: Container(
-                        padding: EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-                        child: Text(
-                          'https://',
-                          style: TextStyle(
-                            color: Colors.grey[600],
-                            fontSize: 16,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-                
-                SizedBox(height: 8),
-                
-                Text(
-                  'Enter your server base  URL without https://',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: Colors.grey[500],
-                  ),
-                ),
-                
-                SizedBox(height: 24),
-                
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextButton(
-                        onPressed: () => Navigator.of(context).pop(),
-                        child: Text(
-                          'Cancel',
-                          style: TextStyle(
-                            color: Colors.grey[600],
-                            fontSize: 16,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                    ),
-                    SizedBox(width: 12),
-                    Expanded(
-                      child: ElevatedButton(
-                        onPressed: () {
-                          String newUrl = _urlController.text.trim();
-                          if (newUrl.isNotEmpty) {
-                            // Format the URL properly
-                            String fullUrl = "https://$newUrl/predict";
-                            _saveApiUrl(fullUrl);
-                            Navigator.of(context).pop();
-                            
-                            // Show success message
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text('API URL updated successfully'),
-                                backgroundColor: Color(0xFF4CAF50),
-                                behavior: SnackBarBehavior.floating,
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(10),
-                                ),
-                              ),
-                            );
-                          }
-                        },
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Color(0xFF4CAF50),
-                          foregroundColor: Colors.white,
-                          padding: EdgeInsets.symmetric(vertical: 12),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(25),
-                          ),
-                          elevation: 0,
-                        ),
-                        child: Text(
-                          'Save',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
+  Widget _button(String label, VoidCallback onTap, bool primary) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 16),
+        decoration: BoxDecoration(
+          color: primary ? const Color(0xFF4CAF50) : Colors.grey[100],
+          borderRadius: BorderRadius.circular(25),
+        ),
+        child: Center(
+          child: Text(
+            label,
+            style: TextStyle(
+              color: primary ? Colors.white : Colors.grey[700],
+              fontSize: 16,
+              fontWeight: FontWeight.w600,
             ),
           ),
-        );
-      },
+        ),
+      ),
     );
   }
+}
+
+enum _CameraFullscreenKind { success, lowConfidence, error }
+
+class _CameraFullscreenData {
+  final Uint8List previewBytes;
+  final String title;
+  final String body;
+  final _CameraFullscreenKind kind;
+
+  const _CameraFullscreenData({
+    required this.previewBytes,
+    required this.title,
+    required this.body,
+    required this.kind,
+  });
+}
+
+class _LeafGuidePainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height * 0.47);
+    final leafHeight = size.height * 0.72;
+    final leafWidth = leafHeight * 0.40;
+
+    final path = Path();
+    path.moveTo(center.dx, center.dy - leafHeight / 2);
+    path.cubicTo(
+      center.dx + leafWidth,
+      center.dy - leafHeight * 0.25,
+      center.dx + leafWidth,
+      center.dy + leafHeight * 0.25,
+      center.dx,
+      center.dy + leafHeight / 2,
+    );
+    path.cubicTo(
+      center.dx - leafWidth,
+      center.dy + leafHeight * 0.25,
+      center.dx - leafWidth,
+      center.dy - leafHeight * 0.25,
+      center.dx,
+      center.dy - leafHeight / 2,
+    );
+
+    final outlinePaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3
+      ..color = const Color(0xFF7CFF7C).withValues(alpha: 0.9);
+    canvas.drawPath(path, outlinePaint);
+
+    final dashedPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2
+      ..color = Colors.white.withValues(alpha: 0.55);
+    final dashPath = Path();
+    const dashLen = 10.0;
+    const dashGap = 8.0;
+    for (
+      double y = center.dy - leafHeight * 0.38;
+      y < center.dy + leafHeight * 0.38;
+      y += dashLen + dashGap
+    ) {
+      dashPath.moveTo(center.dx, y);
+      dashPath.lineTo(
+        center.dx,
+        math.min(y + dashLen, center.dy + leafHeight * 0.38),
+      );
+    }
+    canvas.drawPath(dashPath, dashedPaint);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }

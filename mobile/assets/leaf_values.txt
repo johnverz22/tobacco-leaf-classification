@@ -1,0 +1,17 @@
+=== TOBACCO LEAF GATEKEEPER VALUES ===
+Use these to filter non-tobacco objects in Flutter.
+
+COLOR (HSV RANGE)
+Hue:        14 to 105
+Saturation: 9 to 174
+Value:      100 to 207
+
+SHAPE (GEOMETRY)
+Min Solidity:     0.653
+Aspect Ratio:     1.54 to 2.30
+
+DATASET SUMMARY
+Images scanned:   148
+Leaves used:      148
+
+Note: Solidity below Min or Aspect Ratio outside range => likely NOT a leaf.
